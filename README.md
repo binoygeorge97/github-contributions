@@ -9,7 +9,8 @@
 
 ## Why I Chose This Issue
 
-[1-2 paragraphs explaining why this issue interests you, how it matches your skills/learning goals, what you hope to learn]
+My research involves training sequence models (like S4 and GRUs) using JAX, Flax, and the NNX API. Because I regularly run these models on high-performance computing clusters, I am highly invested in how these high-level framework operations are compiled and optimized for hardware execution.
+This issue sits perfectly at the intersection of my daily modeling workflow and lower-level compiler optimization. By tackling this MLIR optimization pass, I will bridge the gap between theoretical model architecture and backend autodiff compilation, deepening my understanding of the XLA/MLIR ecosystem that powers my research.
 
 ---
 
@@ -17,19 +18,19 @@
 
 ### Problem Description
 
-[In your own words, what's broken or missing?]
+In the JAX/MLIR ecosystem, tensor contractions and matrix multiplications are represented by the stablehlo.dot_general operation. The Enzyme autodiff compiler includes an optimization pass called DotGeneralSimplify designed to mathematically simplify these operations before execution. Currently, this pass fails to recognize when one of the operands is simply a broadcasted scalar.
 
 ### Expected Behavior
 
-[What should happen?]
+If a scalar is broadcasted into a tensor and fed into a dot_general contraction, the compiler should recognize this and replace the heavy contraction with a cheaper, standard element-wise multiplication (mul) using the original scalar.
 
 ### Current Behavior
 
-[What actually happens?]
+The DotGeneralSimplify pass ignores the broadcasted scalar, forcing the compiler to execute a full, computationally expensive tensor contraction.
 
 ### Affected Components
 
-[Which parts of the codebase are involved?]
+The MLIR C++ optimization passes within Enzyme-JAX, specifically the file containing the DotGeneralSimplify logic.
 
 ---
 
@@ -41,9 +42,9 @@
 
 ### Steps to Reproduce
 
-1. [Step 1]
-2. [Step 2]
-3. [Observed result]
+1. Write a small MLIR unit test (or JAX script lowered to MLIR) that broadcasts a scalar and passes it into stablehlo.dot_general.
+2. Run the Enzyme-JAX MLIR optimizer over this specific file.
+3. Observe the output Intermediate Representation (IR).
 
 ### Reproduction Evidence
 
