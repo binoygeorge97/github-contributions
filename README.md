@@ -3,7 +3,8 @@
 **Contribution Number:** 1  
 **Student:** Binoy George 
 **Issue:** https://github.com/EnzymeAD/Enzyme-JAX/issues/1475
-**Status:** Phase I [In Progress]
+**Status:** Phase I [Complete]
+**Progress Update**: commented + forked + approved
 
 ---
 
