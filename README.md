@@ -1,4 +1,4 @@
-# Contribution [#]: [Issue Title]
+# Contribution 1: Extend DotGeneralSimplify to handle Broadcasted Scalars
 
 **Contribution Number:** 1  
 **Student:** Binoy George 
