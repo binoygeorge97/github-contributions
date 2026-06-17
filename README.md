@@ -3,7 +3,7 @@
 **Contribution Number:** 1  
 **Student:** Binoy George 
 **Issue:** https://github.com/EnzymeAD/Enzyme-JAX/issues/1475
-**Status:** Phase I [Complete]
+**Status:** Phase I [Complete], Phase II [Complete]
 **Progress Update**: commented + forked + approved
 
 ---
@@ -38,19 +38,24 @@ The MLIR C++ optimization passes within Enzyme-JAX, specifically the file contai
 
 ### Environment Setup
 
-[Notes on setting up your local development environment - challenges you faced, how you solved them]
+Built on Ubuntu 22.04 (desktop, Xeon E3-1240 v5, 32 GB RAM). The README's stated Bazel version (6.5) is stale — .bazelversion and CI both pin Bazel 7.7.0. Switched from apt-installed Bazel 6.5 to Bazelisk (which auto-downloads the version named in .bazelversion), matching what CI uses. The build target lives at the workspace root (//:enzymexlamlir-opt), not under src/enzyme_ad/jax. Confirmed against .github/workflows/build.yml. First build: ~2h 20m, 7252 actions.
 
 ### Steps to Reproduce
 
-1. Write a small MLIR unit test (or JAX script lowered to MLIR) that broadcasts a scalar and passes it into stablehlo.dot_general.
-2. Run the Enzyme-JAX MLIR optimizer over this specific file.
-3. Observe the output Intermediate Representation (IR).
+1. git clone https://github.com/binoygeorge97/Enzyme-JAX.git && cd Enzyme-JAX
+2. git checkout fix-issue-1475
+3. Install Bazelisk as /usr/local/bin/bazel. It reads .bazelversion and fetches Bazel 7.7.0 automatically.
+4. bazel build //:enzymexlamlir-opt (long; ~2 hours first time, seconds on rebuilds)
+5. ./bazel-bin/enzymexlamlir-opt --enzyme-hlo-opt test/lit_tests/dot_general_bcast_scalar.mlir
+6. Expected: Both functions have their stablehlo.dot_general replaced by a reduce (the same pattern PR #1473 added for splat-constant operands).
+7. Actual: @bcast_rank0_constant is simplified — a different pass folds broadcast_in_dim(constant_scalar) into a splat constant before DotGeneralSimplify runs, so the existing logic catches it. @bcast_rank0_runtime is not simplified — the operand is broadcast_in_dim of a function argument (a non-constant scalar), nothing folds it away, and DotGeneralSimplify only matches via m_Constant. The stablehlo.dot_general survives. Captured in reproduction_output.txt.
 
 ### Reproduction Evidence
 
-- **Commit showing reproduction:** [Link to commit in your fork]
-- **Screenshots/logs:** [If applicable]
-- **My findings:** [What you discovered during reproduction]
+Branch in fork: https://github.com/binoygeorge97/Enzyme-JAX/tree/fix-issue-1475
+Specifically:
+- Reproduction test: test/lit_tests/dot_general_bcast_scalar.mlir
+- Captured output: reproduction_output.txt
 
 ---
 
@@ -68,20 +73,31 @@ The MLIR C++ optimization passes within Enzyme-JAX, specifically the file contai
 
 Using UMPIRE framework (adapted):
 
-**Understand:** [Restate the problem]
+**Understand:** DotGeneralSimplify::matchAndRewriteImpl in src/enzyme_ad/jax/Passes/EnzymeHLOOpt.cpp simplifies dot_general(splat, X) by:
+- replacing with a zero constant when the splat value is zero, or
+- rewriting dot_general(splat, X) as splat_value * reduce(X over contracting dims) for non-zero splats.
 
-**Match:** [What similar patterns/solutions exist in the codebase?]
+It uses matchPattern(operand, m_Constant(&attr)) and checks attr.isSplat(). This misses the equivalent case where the splat-like tensor is produced by stablehlo.broadcast_in_dim of a rank-0 (or rank-1 size-1) tensor that isn't a constant — the most common version of which is a broadcast of a function argument.
+
+**Match:** The same file already contains the building blocks:
+- extractSplatInt walks through BroadcastInDimOp with empty broadcast_dimensions to find an underlying scalar.
+- BroadcastInDimSimplify (further down) handles the rank-0 input case for a different op.
+- BroadcastInDimOpCanon shows the canonical "splat detection" path.
+The fix reuses this shape of logic.
 
 **Plan:** [Step-by-step implementation plan]
-1. [Modify file X to do Y]
-2. [Add function Z]
-3. [Update tests]
+1. In DotGeneralSimplify::matchAndRewriteImpl, generalize the operand-classification step: each operand counts as "splat-like" if either
+(a) it matches m_Constant with attr.isSplat() (today's path), or
+(b) it's a stablehlo::BroadcastInDimOp whose input has rank 0 (or rank 1 with a single element).
+2. When (b) holds, the per-element "scalar value" is the broadcast's input value itself (a Value, not a constant attribute).
+3. Rewrite the existing logic so the rewrite is expressed as "scalar * reduce(other_operand)" where scalar may come from either source. Broadcast scalar back to the result shape and multiply with the reduced tensor.
+4. The existing zero-splat short-circuit only needs to fire when the scalar source is a known-zero constant; for case (b) the value isn't statically known so the general path applies.
 
-**Implement:** [Link to your branch/commits as you work]
+**Implement:** Phase III work. Branch: https://github.com/binoygeorge97/Enzyme-JAX/tree/fix-issue-1475
 
-**Review:** [Self-review checklist - does it follow the project's contribution guidelines?]
+**Review:** Read CONTRIBUTING.md if present; mirror style from git log --oneline -20. Ensure the fix preserves results of every existing test in test/lit_tests/, especially dot_general_ones.mlir.
 
-**Evaluate:** [How will you verify it works?]
+**Evaluate:** Add CHECK-NOT: stablehlo.dot_general assertions to test/lit_tests/dot_general_bcast_scalar.mlir for both functions. After the fix, @bcast_rank0_runtime should no longer contain stablehlo.dot_general in its optimized output. All existing tests under test/lit_tests/ must still pass.
 
 ---
 
