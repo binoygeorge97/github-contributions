@@ -3,7 +3,7 @@
 **Contribution Number:** 1  
 **Student:** Binoy George 
 **Issue:** https://github.com/EnzymeAD/Enzyme-JAX/issues/1475
-**Status:** Phase I [Complete], Phase II [Complete]
+**Status:** Phase I [Complete], Phase II [Complete], Phase III [In Progress]
 **Progress Update**: commented + forked + approved
 
 ---
@@ -63,11 +63,25 @@ Specifically:
 
 ### Analysis
 
-[Your analysis of the root cause - what's causing the issue?]
+The DotGeneralSimplify pattern in src/enzyme_ad/jax/Passes/EnzymeHLOOpt.cpp simplifies dot_general operations when one operand is a splat tensor — for example, dot_general(zero, X) collapses to a constant zero, and dot_general(ones, X) rewrites to a reduce over the contracting dimensions of X. The general form, added in PR #1473, handles any splat: it produces splat_value * reduce(X).
+The detection logic relies on a single MLIR pattern match:
+cpp code:   matchPattern(op.getLhs(), m_Constant(&lhsAttr));
+m_Constant only succeeds when the operand is directly defined by a stablehlo.constant op. This misses an equivalent but structurally different form: a tensor produced by stablehlo.broadcast_in_dim of a rank-0 scalar. Semantically, both forms describe a tensor where every element equals the same scalar — but only the first form gets recognized.
+The reproduction in test/lit_tests/dot_general_bcast_scalar.mlir makes the gap concrete. When the scalar is a compile-time constant, an upstream canonicalizer (BroadcastInDimOpCanon) folds the broadcast_in_dim into a splat constant before DotGeneralSimplify runs, so the existing pattern catches it. When the scalar is a runtime value — a function argument, for instance — no canonicalizer can rewrite it, and DotGeneralSimplify walks past it. The dot_general survives, even though it is mathematically equivalent to scalar * reduce(X) for any value of scalar.
+The root cause is therefore not a logic bug in the simplification itself but a too-narrow operand detector: DotGeneralSimplify treats "splat constant" and "splat-like tensor" as the same thing, when in fact the latter is the more general concept it should match on.
 
 ### Proposed Solution
 
-[High-level description of your fix approach]
+Generalize the operand-classification step in DotGeneralSimplify::matchAndRewriteImpl so that it recognizes both forms of a splat-like operand:
+
+A splat constant (the current path), via matchPattern(v, m_Constant(&splat)) plus splat.isSplat().
+A stablehlo.broadcast_in_dim of a rank-0 tensor, where the operand's underlying scalar is whatever the broadcast was given as input — possibly a runtime Value, not a compile-time attribute.
+
+This is implemented as a small helper, extractSplatLikeScalar, that returns a scalar Value for either form and nullptr otherwise. The shape of this helper mirrors extractSplatInt already in the same file, which uses the same trick for integer comparisons.
+The downstream rewrite then needs one careful distinction:
+
+The existing "splat zero → constant zero" short-circuit can only fire when the scalar is statically known to be zero. For a runtime scalar from case 2, this branch is skipped entirely.
+The general "splat-like → scalar * reduce(other_operand)" rewrite works for both cases. The scalar is broadcast back to the result shape and multiplied with the reduced tensor. When the scalar is 1.0, an existing canonicalizer collapses the multiply away — which is why the constant-1 case in dot_general_ones.mlir currently produces a bare reduce.
 
 ### Implementation Plan
 
@@ -103,11 +117,22 @@ The fix reuses this shape of logic.
 
 ## Testing Strategy
 
+Reproduction baseline. test/lit_tests/dot_general_bcast_scalar.mlir already demonstrates the gap (Phase II). It contains two functions: a constant-broadcast variant (works pre-fix) and a runtime-scalar variant (broken pre-fix). After the fix, both should optimize away the dot_general.
+Regression check. After every meaningful edit I rerun ./bazel-bin/enzymexlamlir-opt --enzyme-hlo-opt test/lit_tests/dot_general_ones.mlir and diff against the captured baseline output. So far identical.
+Planned final checks:
+
+Verify variant B output collapses to reduce → broadcast → multiply matching the structure used by the existing constant path.
+Run the broader directory sweep: for f in test/lit_tests/*.mlir; do ./bazel-bin/enzymexlamlir-opt --enzyme-hlo-opt "$f" > /dev/null 2>&1 || echo "FAILED: $f"; done.
+Attempt bazel test //test/lit_tests/... for the proper lit-based regression run.
+
 ### Unit Tests
 
-- [ ] Test case 1: [Description]
-- [ ] Test case 2: [Description]
-- [ ] Test case 3: [Description]
+- [ ] Test case 1: Reproduction baseline. test/lit_tests/dot_general_bcast_scalar.mlir already demonstrates the gap (Phase II). It contains two functions: a constant-broadcast variant (works pre-fix) and a runtime-scalar variant (broken pre-fix). After the fix, both should optimize away the dot_general.
+- [ ] Test case 2: Regression check. After every meaningful edit I rerun ./bazel-bin/enzymexlamlir-opt --enzyme-hlo-opt test/lit_tests/dot_general_ones.mlir and diff against the captured baseline output. So far identical.
+- [ ] Test case 3: Planned final checks:
+Verify variant B output collapses to reduce → broadcast → multiply matching the structure used by the existing constant path.
+Run the broader directory sweep: for f in test/lit_tests/*.mlir; do ./bazel-bin/enzymexlamlir-opt --enzyme-hlo-opt "$f" > /dev/null 2>&1 || echo "FAILED: $f"; done.
+Attempt bazel test //test/lit_tests/... for the proper lit-based regression run.
 
 ### Integration Tests
 
@@ -132,8 +157,9 @@ The fix reuses this shape of logic.
 
 ### Code Changes
 
-- **Files modified:** [List]
-- **Key commits:** [Links to important commits]
+- **Files modified:** src/enzyme_ad/jax/Passes/EnzymeHLOOpt.cpp — added extractSplatLikeScalar helper and refactored DotGeneralSimplify::matchAndRewriteImpl to use it.
+test/lit_tests/dot_general_bcast_scalar.mlir — reproduction test (from Phase II). Will be extended with positive checks once the rewrite is complete.
+- **Key commits:** In Progress...
 - **Approach decisions:** [Why you chose certain approaches]
 
 ---
