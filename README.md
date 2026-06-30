@@ -18,19 +18,19 @@ My research involves training sequence models (like S4 and GRUs) using JAX, Flax
 
 ### Problem Description
 
-In the JAX/MLIR ecosystem, tensor contractions and matrix multiplications are represented by the stablehlo.dot_general operation. The Enzyme autodiff compiler includes an optimization pass called DotGeneralSimplify designed to mathematically simplify these operations before execution. Currently, this pass fails to recognize when one of the operands is simply a broadcasted scalar.
+In the JAX/MLIR ecosystem, tensor contractions and matrix multiplications are represented by the `stablehlo.dot_general` operation. Enzyme-JAX includes an optimization pass, `DotGeneralSimplify`, that mathematically simplifies these operations before execution. Currently, this pass recognizes a *splat constant* operand but fails to recognize the equivalent case where an operand is a **broadcast of a scalar** (`broadcast_in_dim` of a rank-0 tensor), particularly when that scalar is a runtime value rather than a compile-time constant.
 
 ### Expected Behavior
 
-If a scalar is broadcasted into a tensor and fed into a dot_general contraction, the compiler should recognize this and replace the heavy contraction with a cheaper, standard element-wise multiplication (mul) using the original scalar.
+When one `dot_general` operand is a splat-like tensor (every element equal to the same scalar `s`), the contraction over the contracting dimensions equals `s * reduce(other_operand)`, broadcast back to the result shape. The compiler should perform this rewrite for both the splat-constant form and the broadcast-of-scalar form. When `s == 1.0`, an existing canonicalizer collapses the multiply away, leaving a bare `reduce` + `broadcast_in_dim` (this is exactly what the constant case already produces).
 
 ### Current Behavior
 
-The DotGeneralSimplify pass ignores the broadcasted scalar, forcing the compiler to execute a full, computationally expensive tensor contraction.
+`DotGeneralSimplify` detects the splat operand only via `matchPattern(operand, m_Constant(...))`. A `broadcast_in_dim` of a runtime scalar is never folded into a constant by any upstream pass, so the detector walks past it and the full, expensive `dot_general` contraction survives.
 
 ### Affected Components
 
-The MLIR C++ optimization passes within Enzyme-JAX, specifically the file containing the DotGeneralSimplify logic.
+The MLIR C++ optimization passes within Enzyme-JAX, specifically `DotGeneralSimplify` in `src/enzyme_ad/jax/Passes/EnzymeHLOOpt.cpp`.
 
 ---
 
@@ -38,24 +38,29 @@ The MLIR C++ optimization passes within Enzyme-JAX, specifically the file contai
 
 ### Environment Setup
 
-Built on Ubuntu 22.04 (desktop, Xeon E3-1240 v5, 32 GB RAM). The README's stated Bazel version (6.5) is stale — .bazelversion and CI both pin Bazel 7.7.0. Switched from apt-installed Bazel 6.5 to Bazelisk (which auto-downloads the version named in .bazelversion), matching what CI uses. The build target lives at the workspace root (//:enzymexlamlir-opt), not under src/enzyme_ad/jax. Confirmed against .github/workflows/build.yml. First build: ~2h 20m, 7252 actions.
+Reproduced and built on **two environments**:
+
+- **Lab PC:** Ubuntu 22.04.5, Intel Xeon E3-1240 v5 (4c/8t), 32 GB RAM. First build with Clang 14 + lld 14: ~2h 20m, 7,252 actions.
+- **Home PC:** Ubuntu 24.04.4, Intel Core i7-9700K (8c), 32 GB RAM. First build with **GCC 13.3** (no Clang installed): **~54 min (3,244s), 7,324 actions.** GCC is a first-class supported path in this repo (the BUILD files contain GCC-specific `select()` branches), and the build completed cleanly.
+
+Common to both: the README's stated Bazel version (6.5) is stale — `.bazelversion` and CI both pin **Bazel 7.7.0**. Used **Bazelisk** (auto-downloads the version named in `.bazelversion`), matching CI. The build target lives at the workspace root (`//:enzymexlamlir-opt`), not under `src/enzyme_ad/jax`. Confirmed against `.github/workflows/build.yml`.
 
 ### Steps to Reproduce
 
-1. git clone https://github.com/binoygeorge97/Enzyme-JAX.git && cd Enzyme-JAX
-2. git checkout fix-issue-1475
-3. Install Bazelisk as /usr/local/bin/bazel. It reads .bazelversion and fetches Bazel 7.7.0 automatically.
-4. bazel build //:enzymexlamlir-opt (long; ~2 hours first time, seconds on rebuilds)
-5. ./bazel-bin/enzymexlamlir-opt --enzyme-hlo-opt test/lit_tests/dot_general_bcast_scalar.mlir
-6. Expected: Both functions have their stablehlo.dot_general replaced by a reduce (the same pattern PR #1473 added for splat-constant operands).
-7. Actual: @bcast_rank0_constant is simplified — a different pass folds broadcast_in_dim(constant_scalar) into a splat constant before DotGeneralSimplify runs, so the existing logic catches it. @bcast_rank0_runtime is not simplified — the operand is broadcast_in_dim of a function argument (a non-constant scalar), nothing folds it away, and DotGeneralSimplify only matches via m_Constant. The stablehlo.dot_general survives. Captured in reproduction_output.txt.
+1. `git clone https://github.com/binoygeorge97/Enzyme-JAX.git && cd Enzyme-JAX`
+2. `git checkout fix-issue-1475`
+3. Install Bazelisk as `/usr/local/bin/bazel`. It reads `.bazelversion` and fetches Bazel 7.7.0 automatically.
+4. `bazel build //:enzymexlamlir-opt` (long; ~1–2 hours first time, seconds-to-minutes on rebuilds).
+5. `./bazel-bin/enzymexlamlir-opt --enzyme-hlo-opt test/lit_tests/dot_general_bcast_scalar.mlir`
+6. **Expected (the gap):** the constant-broadcast variant simplifies away its `dot_general`; the runtime-scalar variant does **not**, even though it is mathematically equivalent.
+7. **Actual:** `@bcast_rank0_constant` is simplified — an upstream canonicalizer (`BroadcastInDimOpCanon`) folds `broadcast_in_dim(constant_scalar)` into a splat constant before `DotGeneralSimplify` runs, so the existing logic catches it (output: `reduce(add)` over dim 0, then `broadcast_in_dim` to the result shape). `@bcast_rank0_runtime` is **not** simplified — the operand is `broadcast_in_dim` of a function argument (a non-constant scalar); nothing folds it away, and `DotGeneralSimplify` only matches via `m_Constant`. The `stablehlo.dot_general` survives.
 
 ### Reproduction Evidence
 
 Branch in fork: https://github.com/binoygeorge97/Enzyme-JAX/tree/fix-issue-1475
-Specifically:
-- Reproduction test: test/lit_tests/dot_general_bcast_scalar.mlir
-- Captured output: reproduction_output.txt
+
+- Reproduction test (committed): `test/lit_tests/dot_general_bcast_scalar.mlir` — commit `952b8104`.
+- Captured optimizer output demonstrating the gap (the runtime variant retaining its `dot_general` while the constant variant is reduced to `reduce` + `broadcast_in_dim`).
 
 ---
 
@@ -63,76 +68,52 @@ Specifically:
 
 ### Analysis
 
-The DotGeneralSimplify pattern in src/enzyme_ad/jax/Passes/EnzymeHLOOpt.cpp simplifies dot_general operations when one operand is a splat tensor — for example, dot_general(zero, X) collapses to a constant zero, and dot_general(ones, X) rewrites to a reduce over the contracting dimensions of X. The general form, added in PR #1473, handles any splat: it produces splat_value * reduce(X).
-The detection logic relies on a single MLIR pattern match:
-cpp code:   matchPattern(op.getLhs(), m_Constant(&lhsAttr));
-m_Constant only succeeds when the operand is directly defined by a stablehlo.constant op. This misses an equivalent but structurally different form: a tensor produced by stablehlo.broadcast_in_dim of a rank-0 scalar. Semantically, both forms describe a tensor where every element equals the same scalar — but only the first form gets recognized.
-The reproduction in test/lit_tests/dot_general_bcast_scalar.mlir makes the gap concrete. When the scalar is a compile-time constant, an upstream canonicalizer (BroadcastInDimOpCanon) folds the broadcast_in_dim into a splat constant before DotGeneralSimplify runs, so the existing pattern catches it. When the scalar is a runtime value — a function argument, for instance — no canonicalizer can rewrite it, and DotGeneralSimplify walks past it. The dot_general survives, even though it is mathematically equivalent to scalar * reduce(X) for any value of scalar.
-The root cause is therefore not a logic bug in the simplification itself but a too-narrow operand detector: DotGeneralSimplify treats "splat constant" and "splat-like tensor" as the same thing, when in fact the latter is the more general concept it should match on.
+`DotGeneralSimplify` simplifies `dot_general` when one operand is a splat tensor — `dot_general(zero, X)` collapses to a constant zero, and `dot_general(ones, X)` rewrites to a reduce over the contracting dimensions of X. The general form (PR #1473) handles any splat as `splat_value * reduce(X)`.
+
+The detection relies on a single match: `matchPattern(op.getLhs(), m_Constant(&lhsAttr))`. `m_Constant` only succeeds when the operand is directly defined by a `stablehlo.constant`. It misses the equivalent form: a tensor produced by `stablehlo.broadcast_in_dim` of a rank-0 scalar.
+
+When the scalar is a compile-time constant, `BroadcastInDimOpCanon` folds the broadcast into a splat constant before `DotGeneralSimplify` runs, so the existing pattern catches it. When the scalar is a runtime value, no canonicalizer can rewrite it, and `DotGeneralSimplify` walks past it — even though the op is equivalent to `scalar * reduce(X)` for any value of scalar.
+
+The root cause is a too-narrow operand detector: `DotGeneralSimplify` treats "splat constant" and "splat-like tensor" as the same thing, when the latter is the more general concept it should match.
 
 ### Proposed Solution
 
-Generalize the operand-classification step in DotGeneralSimplify::matchAndRewriteImpl so that it recognizes both forms of a splat-like operand:
+Generalize the operand-classification step in `DotGeneralSimplify::matchAndRewriteImpl` to recognize both forms:
 
-A splat constant (the current path), via matchPattern(v, m_Constant(&splat)) plus splat.isSplat().
-A stablehlo.broadcast_in_dim of a rank-0 tensor, where the operand's underlying scalar is whatever the broadcast was given as input — possibly a runtime Value, not a compile-time attribute.
+(a) a splat constant via `matchPattern(v, m_Constant(&splat))` + `splat.isSplat()` (current path), and  
+(b) a `stablehlo.broadcast_in_dim` of a rank-0 tensor, where the underlying scalar may be a runtime `Value`.
 
-This is implemented as a small helper, extractSplatLikeScalar, that returns a scalar Value for either form and nullptr otherwise. The shape of this helper mirrors extractSplatInt already in the same file, which uses the same trick for integer comparisons.
-The downstream rewrite then needs one careful distinction:
+Planned as a small helper, `extractSplatLikeScalar`, returning a scalar `Value` for either form and `nullptr` otherwise — mirroring the existing `extractSplatInt` helper in the same file.
 
-The existing "splat zero → constant zero" short-circuit can only fire when the scalar is statically known to be zero. For a runtime scalar from case 2, this branch is skipped entirely.
-The general "splat-like → scalar * reduce(other_operand)" rewrite works for both cases. The scalar is broadcast back to the result shape and multiplied with the reduced tensor. When the scalar is 1.0, an existing canonicalizer collapses the multiply away — which is why the constant-1 case in dot_general_ones.mlir currently produces a bare reduce.
+One careful distinction in the rewrite:
 
-### Implementation Plan
+- The "splat zero → constant zero" short-circuit can only fire when the scalar is statically known to be zero; for a runtime scalar it is skipped.
+- The general "splat-like → scalar * reduce(other_operand)" rewrite applies to both cases. When the scalar is 1.0, an existing canonicalizer collapses the multiply, which is why the constant-1 case in `dot_general_ones.mlir` produces a bare reduce.
 
-Using UMPIRE framework (adapted):
+### Implementation Plan (UMPIRE)
 
-**Understand:** DotGeneralSimplify::matchAndRewriteImpl in src/enzyme_ad/jax/Passes/EnzymeHLOOpt.cpp simplifies dot_general(splat, X) by:
-- replacing with a zero constant when the splat value is zero, or
-- rewriting dot_general(splat, X) as splat_value * reduce(X over contracting dims) for non-zero splats.
+**Understand / Match / Plan:** as above; the file already contains the building blocks (`extractSplatInt`, `BroadcastInDimSimplify`, `BroadcastInDimOpCanon`).
 
-It uses matchPattern(operand, m_Constant(&attr)) and checks attr.isSplat(). This misses the equivalent case where the splat-like tensor is produced by stablehlo.broadcast_in_dim of a rank-0 (or rank-1 size-1) tensor that isn't a constant — the most common version of which is a broadcast of a function argument.
+**Implement:** Phase III work — *not yet started in code.* The reproduction test is committed (`952b8104`); `EnzymeHLOOpt.cpp` has not yet been modified.
 
-**Match:** The same file already contains the building blocks:
-- extractSplatInt walks through BroadcastInDimOp with empty broadcast_dimensions to find an underlying scalar.
-- BroadcastInDimSimplify (further down) handles the rank-0 input case for a different op.
-- BroadcastInDimOpCanon shows the canonical "splat detection" path.
-The fix reuses this shape of logic.
+**Review:** Mirror style from `git log --oneline -20`; check for `CONTRIBUTING.md`. Preserve results of every existing test, especially `dot_general_ones.mlir`.
 
-**Plan:** [Step-by-step implementation plan]
-1. In DotGeneralSimplify::matchAndRewriteImpl, generalize the operand-classification step: each operand counts as "splat-like" if either
-(a) it matches m_Constant with attr.isSplat() (today's path), or
-(b) it's a stablehlo::BroadcastInDimOp whose input has rank 0 (or rank 1 with a single element).
-2. When (b) holds, the per-element "scalar value" is the broadcast's input value itself (a Value, not a constant attribute).
-3. Rewrite the existing logic so the rewrite is expressed as "scalar * reduce(other_operand)" where scalar may come from either source. Broadcast scalar back to the result shape and multiply with the reduced tensor.
-4. The existing zero-splat short-circuit only needs to fire when the scalar source is a known-zero constant; for case (b) the value isn't statically known so the general path applies.
-
-**Implement:** Phase III work. Branch: https://github.com/binoygeorge97/Enzyme-JAX/tree/fix-issue-1475
-
-**Review:** Read CONTRIBUTING.md if present; mirror style from git log --oneline -20. Ensure the fix preserves results of every existing test in test/lit_tests/, especially dot_general_ones.mlir.
-
-**Evaluate:** Add CHECK-NOT: stablehlo.dot_general assertions to test/lit_tests/dot_general_bcast_scalar.mlir for both functions. After the fix, @bcast_rank0_runtime should no longer contain stablehlo.dot_general in its optimized output. All existing tests under test/lit_tests/ must still pass.
+**Evaluate:** After the fix, flip the runtime variant's assertion in `dot_general_bcast_scalar.mlir` from `CHECK: stablehlo.dot_general` to `CHECK-NOT: stablehlo.dot_general`. All existing `test/lit_tests/` must still pass.
 
 ---
 
 ## Testing Strategy
 
-Reproduction baseline. test/lit_tests/dot_general_bcast_scalar.mlir already demonstrates the gap (Phase II). It contains two functions: a constant-broadcast variant (works pre-fix) and a runtime-scalar variant (broken pre-fix). After the fix, both should optimize away the dot_general.
-Regression check. After every meaningful edit I rerun ./bazel-bin/enzymexlamlir-opt --enzyme-hlo-opt test/lit_tests/dot_general_ones.mlir and diff against the captured baseline output. So far identical.
-Planned final checks:
-
-Verify variant B output collapses to reduce → broadcast → multiply matching the structure used by the existing constant path.
-Run the broader directory sweep: for f in test/lit_tests/*.mlir; do ./bazel-bin/enzymexlamlir-opt --enzyme-hlo-opt "$f" > /dev/null 2>&1 || echo "FAILED: $f"; done.
-Attempt bazel test //test/lit_tests/... for the proper lit-based regression run.
+- **Reproduction baseline (done):** `test/lit_tests/dot_general_bcast_scalar.mlir` demonstrates the gap. Constant variant simplifies pre-fix; runtime variant does not.
+- **Regression check (planned per-edit):** rerun `dot_general_ones.mlir` through the opt tool and diff against captured baseline.
+- **Final checks (planned):** confirm the runtime variant collapses to the same `reduce` (+ multiply, when scalar ≠ 1) structure as the constant path; directory sweep over `test/lit_tests/*.mlir`; `bazel test //test/lit_tests/...` for the proper lit run.
 
 ### Unit Tests
 
-- [ ] Test case 1: Reproduction baseline. test/lit_tests/dot_general_bcast_scalar.mlir already demonstrates the gap (Phase II). It contains two functions: a constant-broadcast variant (works pre-fix) and a runtime-scalar variant (broken pre-fix). After the fix, both should optimize away the dot_general.
-- [ ] Test case 2: Regression check. After every meaningful edit I rerun ./bazel-bin/enzymexlamlir-opt --enzyme-hlo-opt test/lit_tests/dot_general_ones.mlir and diff against the captured baseline output. So far identical.
-- [ ] Test case 3: Planned final checks:
-Verify variant B output collapses to reduce → broadcast → multiply matching the structure used by the existing constant path.
-Run the broader directory sweep: for f in test/lit_tests/*.mlir; do ./bazel-bin/enzymexlamlir-opt --enzyme-hlo-opt "$f" > /dev/null 2>&1 || echo "FAILED: $f"; done.
-Attempt bazel test //test/lit_tests/... for the proper lit-based regression run.
+- [x] Reproduction baseline committed (Phase II): two functions, constant-broadcast (works pre-fix) and runtime-scalar (broken pre-fix).
+- [ ] Post-fix: runtime variant no longer contains `stablehlo.dot_general`.
+- [ ] Regression: `dot_general_ones.mlir` output unchanged after the fix.
+- [ ] Directory sweep + `bazel test //test/lit_tests/...` green.
 
 ### Integration Tests
 
