@@ -68,11 +68,11 @@ Branch in fork: https://github.com/binoygeorge97/Enzyme-JAX/tree/fix-issue-1475
 
 ### Analysis
 
-`DotGeneralSimplify` simplifies `dot_general` when one operand is a splat tensor — `dot_general(zero, X)` collapses to a constant zero, and `dot_general(ones, X)` rewrites to a reduce over the contracting dimensions of X. The general form (PR #1473) handles any splat as `splat_value * reduce(X)`.
+`DotGeneralSimplify` simplifies `dot_general` when one operand is a splat tensor — `dot_general(zero, X)` collapses to a constant zero, and `dot_general(ones, X)` rewrites to a reduce over the contracting dimensions of X. The general form (PR #1473) rewrites dot_general(splat, X) to reduce(X over contracting dims) broadcast to the result shape, multiplied by the splat value. This is confirmed by dot_general_ones.mlir: the splat-of-5.0 case (@main2) produces reduce → multiply by 5.0, while the splat-of-1.0 case (@main) produces a bare reduce with no multiply.
 
 The detection relies on a single match: `matchPattern(op.getLhs(), m_Constant(&lhsAttr))`. `m_Constant` only succeeds when the operand is directly defined by a `stablehlo.constant`. It misses the equivalent form: a tensor produced by `stablehlo.broadcast_in_dim` of a rank-0 scalar.
 
-When the scalar is a compile-time constant, `BroadcastInDimOpCanon` folds the broadcast into a splat constant before `DotGeneralSimplify` runs, so the existing pattern catches it. When the scalar is a runtime value, no canonicalizer can rewrite it, and `DotGeneralSimplify` walks past it — even though the op is equivalent to `scalar * reduce(X)` for any value of scalar.
+When the scalar is a compile-time constant, an upstream canonicalizer folds the broadcast into a splat constant before DotGeneralSimplify runs, so the existing pattern catches it. When the scalar is a runtime value, no canonicalizer can rewrite it, and `DotGeneralSimplify` walks past it — even though the op is equivalent to `scalar * reduce(X)` for any value of scalar.
 
 The root cause is a too-narrow operand detector: `DotGeneralSimplify` treats "splat constant" and "splat-like tensor" as the same thing, when the latter is the more general concept it should match.
 
@@ -83,12 +83,14 @@ Generalize the operand-classification step in `DotGeneralSimplify::matchAndRewri
 (a) a splat constant via `matchPattern(v, m_Constant(&splat))` + `splat.isSplat()` (current path), and  
 (b) a `stablehlo.broadcast_in_dim` of a rank-0 tensor, where the underlying scalar may be a runtime `Value`.
 
-Planned as a small helper, `extractSplatLikeScalar`, returning a scalar `Value` for either form and `nullptr` otherwise — mirroring the existing `extractSplatInt` helper in the same file.
+Planned as a small helper, extractSplatLikeScalar, that returns the underlying scalar Value for either form and nullptr otherwise. It mirrors the empty-broadcast_dimensions look-through used by the existing extractSplatInt helper (line 13754) — but returns the scalar operand Value rather than an integer, since the runtime case has no compile-time attribute.
 
 One careful distinction in the rewrite:
 
 - The "splat zero → constant zero" short-circuit can only fire when the scalar is statically known to be zero; for a runtime scalar it is skipped.
-- The general "splat-like → scalar * reduce(other_operand)" rewrite applies to both cases. When the scalar is 1.0, an existing canonicalizer collapses the multiply, which is why the constant-1 case in `dot_general_ones.mlir` produces a bare reduce.
+- The general "splat-like → scalar × reduce(other_operand)" rewrite applies to both cases, but the multiply differs by source. The existing constant path multiplies by a constant built from the splat attribute, and skips the multiply entirely when the value is 1.0 — which is why @main in dot_general_ones.mlir shows a bare reduce. The runtime path has no attribute, so it multiplies the reduce result by the broadcast's input Value and always emits the multiply, relying on the same downstream canonicalizer to collapse it if the value happens to be 1.0.
+
+The fix must handle the broadcast-of-scalar on either operand position, mirroring the existing code's separate LHS-constant and RHS-constant branches. The reproduction test only exercises the LHS case, but a robust fix (and a reviewer) will expect both.
 
 ### Implementation Plan (UMPIRE)
 
