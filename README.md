@@ -52,8 +52,8 @@ Common to both: the README's stated Bazel version (6.5) is stale — `.bazelvers
 3. Install Bazelisk as `/usr/local/bin/bazel`. It reads `.bazelversion` and fetches Bazel 7.7.0 automatically.
 4. `bazel build //:enzymexlamlir-opt` (long; ~1–2 hours first time, seconds-to-minutes on rebuilds).
 5. `./bazel-bin/enzymexlamlir-opt --enzyme-hlo-opt test/lit_tests/dot_general_bcast_scalar.mlir`
-6. **Expected (the gap):** the constant-broadcast variant simplifies away its `dot_general`; the runtime-scalar variant does **not**, even though it is mathematically equivalent.
-7. **Actual:** `@bcast_rank0_constant` is simplified — an upstream canonicalizer (`BroadcastInDimOpCanon`) folds `broadcast_in_dim(constant_scalar)` into a splat constant before `DotGeneralSimplify` runs, so the existing logic catches it (output: `reduce(add)` over dim 0, then `broadcast_in_dim` to the result shape). `@bcast_rank0_runtime` is **not** simplified — the operand is `broadcast_in_dim` of a function argument (a non-constant scalar); nothing folds it away, and `DotGeneralSimplify` only matches via `m_Constant`. The `stablehlo.dot_general` survives.
+6. **Expected (correct behavior):** both functions should have their stablehlo.dot_general eliminated — each is mathematically scalar * reduce(arg1), broadcast to the result shape. This is what the fix will produce.
+7. **Actual (the gap):** only @bcast_rank0_constant is simplified. An upstream canonicalizer folds broadcast_in_dim(constant_scalar) into a splat constant before DotGeneralSimplify runs, so the existing logic catches it (output: reduce(add) over dim 0, then broadcast_in_dim to the result shape). @bcast_rank0_runtime is NOT simplified — its operand is broadcast_in_dim of a function argument (a non-constant scalar); nothing folds it away, and DotGeneralSimplify only matches via m_Constant. The stablehlo.dot_general survives.
 
 ### Reproduction Evidence
 
