@@ -4,7 +4,7 @@
 **Student:** Binoy George 
 **Issue:** https://github.com/EnzymeAD/Enzyme-JAX/issues/1475
 **Status:** Phase I [Complete], Phase II [Complete], Phase III [In Progress]
-**Progress Update**: commented + forked + approved
+**Progress Update**: commented + forked + approved; reproduction test on branch; home-PC build working (GCC 13.3); git auth + fork sync resolved. Fix not yet implemented — next step is editing DotGeneralSimplify.
 
 ---
 
@@ -59,7 +59,7 @@ Common to both: the README's stated Bazel version (6.5) is stale — `.bazelvers
 
 Branch in fork: https://github.com/binoygeorge97/Enzyme-JAX/tree/fix-issue-1475
 
-- Reproduction test (committed): `test/lit_tests/dot_general_bcast_scalar.mlir` — commit `952b8104`.
+- Reproduction test (committed): `test/lit_tests/dot_general_bcast_scalar.mlir` — commit `559b9f7e`, on branch head `aea96bcf`.
 - Captured optimizer output demonstrating the gap (the runtime variant retaining its `dot_general` while the constant variant is reduced to `reduce` + `broadcast_in_dim`).
 
 ---
@@ -98,7 +98,7 @@ One careful distinction in the rewrite:
 
 **Review:** Mirror style from `git log --oneline -20`; check for `CONTRIBUTING.md`. Preserve results of every existing test, especially `dot_general_ones.mlir`.
 
-**Evaluate:** After the fix, flip the runtime variant's assertion in `dot_general_bcast_scalar.mlir` from `CHECK: stablehlo.dot_general` to `CHECK-NOT: stablehlo.dot_general`. All existing `test/lit_tests/` must still pass.
+**Evaluate:** The test already asserts `CHECK-NOT: stablehlo.dot_general` for both variants (the target state). Variant B fails today by design and turns green once the fix lands. All existing `test/lit_tests/` must still pass.
 
 ---
 
@@ -128,9 +128,12 @@ One careful distinction in the rewrite:
 
 ## Implementation Notes
 
-### Week [X] Progress
+### Week 5 Progress
 
-[What you built this week, challenges faced, decisions made]
+- Set up and verified the build on the home PC (Ubuntu 24.04.4, i7-9700K, GCC 13.3): ~54 min first build, 7,324 actions, completed clean.
+- Resolved GitHub auth (classic PAT with `repo` scope) and reconciled a diverged `fix-issue-1475` (a duplicate reproduction commit made here vs. the lab commit already on the fork). Reset local to `origin/fix-issue-1475` (`aea96bcf`); local and remote now identical.
+- Re-confirmed the gap: variant A (constant scalar) simplifies to reduce + broadcast; variant B (runtime scalar) retains its dot_general.
+- Located the code to edit: `DotGeneralSimplify` at line ~9598, and the helper to mirror (`extractSplatInt`) at ~13754, both in `EnzymeHLOOpt.cpp`. Fix editing is the next step.
 
 ### Week [Y] Progress
 
@@ -138,9 +141,8 @@ One careful distinction in the rewrite:
 
 ### Code Changes
 
-- **Files modified:** src/enzyme_ad/jax/Passes/EnzymeHLOOpt.cpp — added extractSplatLikeScalar helper and refactored DotGeneralSimplify::matchAndRewriteImpl to use it.
-test/lit_tests/dot_general_bcast_scalar.mlir — reproduction test (from Phase II). Will be extended with positive checks once the rewrite is complete.
-- **Key commits:** In Progress...
+- **Files to modify (planned):** src/enzyme_ad/jax/Passes/EnzymeHLOOpt.cpp — add extractSplatLikeScalar helper and refactor DotGeneralSimplify::matchAndRewriteImpl to use it. test/lit_tests/dot_general_bcast_scalar.mlir — reproduction test, already committed.
+- **Key commits:** 559b9f7e (reproduction test). Fix commit: not yet.
 - **Approach decisions:** [Why you chose certain approaches]
 
 ---
