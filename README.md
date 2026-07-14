@@ -4,7 +4,7 @@
 **Student:** Binoy George 
 **Issue:** https://github.com/EnzymeAD/Enzyme-JAX/issues/1475
 **Status:** Phase I [Complete], Phase II [Complete], Phase III [In Progress]
-**Progress Update**: commented + forked + approved; reproduction test on branch; home-PC build working (GCC 13.3); git auth + fork sync resolved. Fix not yet implemented — next step is editing DotGeneralSimplify.
+**Progress Update**: commented + forked + approved; reproduction test on branch; home-PC build working (GCC 13.3); git auth + fork sync resolved. Fix implemented in DotGeneralSimplify (extractBroadcastScalar helper + runtime path); incremental build clean; reproduction test passes; investigating three multifloat lit failures.
 
 ---
 
@@ -68,9 +68,9 @@ Branch in fork: https://github.com/binoygeorge97/Enzyme-JAX/tree/fix-issue-1475
 
 ### Analysis
 
-`DotGeneralSimplify` simplifies `dot_general` when one operand is a splat tensor — `dot_general(zero, X)` collapses to a constant zero, and `dot_general(ones, X)` rewrites to a reduce over the contracting dimensions of X. The general form (PR #1473) rewrites dot_general(splat, X) to reduce(X over contracting dims) broadcast to the result shape, multiplied by the splat value. This is confirmed by dot_general_ones.mlir: the splat-of-5.0 case (@main2) produces reduce → multiply by 5.0, while the splat-of-1.0 case (@main) produces a bare reduce with no multiply.
+`DotGeneralSimplify` simplifies `dot_general` when one operand is a splat tensor — `dot_general(zero, X)` collapses to a constant zero, and `dot_general(ones, X)` rewrites to a reduce over the contracting dimensions of X. The general form (PR #1473) rewrites dot_general(splat, X) to reduce(X over contracting dims) broadcast to the result shape, multiplied by the splat value. This is confirmed by dot_general_ones.mlir: the splat-of-5.0 case (@main2) shows reduce → multiply by 5.0, while the splat-of-1.0 case (@main) shows a bare reduce. Note the pass always emits the multiply; @main appears without one only because a downstream canonicalizer folds "multiply by splat-1.0" away.
 
-The detection relies on a single match: `matchPattern(op.getLhs(), m_Constant(&lhsAttr))`. `m_Constant` only succeeds when the operand is directly defined by a `stablehlo.constant`. It misses the equivalent form: a tensor produced by `stablehlo.broadcast_in_dim` of a rank-0 scalar.
+The splat detection uses a typed capture: matchPattern(op.getLhs(), m_Constant(&splatElementsAttr)) where splatElementsAttr is a SplatElementsAttr — the typed attribute is what restricts the match to splats. This only succeeds when the operand is directly defined by a stablehlo.constant.
 
 When the scalar is a compile-time constant, an upstream canonicalizer folds the broadcast into a splat constant before DotGeneralSimplify runs, so the existing pattern catches it. When the scalar is a runtime value, no canonicalizer can rewrite it, and `DotGeneralSimplify` walks past it — even though the op is equivalent to `scalar * reduce(X)` for any value of scalar.
 
@@ -78,25 +78,21 @@ The root cause is a too-narrow operand detector: `DotGeneralSimplify` treats "sp
 
 ### Proposed Solution
 
-Generalize the operand-classification step in `DotGeneralSimplify::matchAndRewriteImpl` to recognize both forms:
+Generalize the operand-classification step in DotGeneralSimplify::matchAndRewriteImpl. The constant path is unchanged — the existing typed SplatElementsAttr capture still handles splat constants, so the emitted IR for constant operands is identical. The fix adds a separate detector for a stablehlo.broadcast_in_dim of a rank-0 tensor (empty broadcast_dimensions), whose underlying scalar may be a runtime Value.
+This detector is a small helper, extractBroadcastScalar, that returns the scalar Value for the broadcast-of-rank-0 form and a null Value otherwise. It mirrors the empty-broadcast_dimensions look-through in the existing extractSplatInt helper (line 13754), but returns the operand Value rather than an integer, since the runtime case has no compile-time attribute. It deliberately does not unify the constant case.
 
-(a) a splat constant via `matchPattern(v, m_Constant(&splat))` + `splat.isSplat()` (current path), and  
-(b) a `stablehlo.broadcast_in_dim` of a rank-0 tensor, where the underlying scalar may be a runtime `Value`.
+Two distinctions in the rewrite:
 
-Planned as a small helper, extractSplatLikeScalar, that returns the underlying scalar Value for either form and nullptr otherwise. It mirrors the empty-broadcast_dimensions look-through used by the existing extractSplatInt helper (line 13754) — but returns the scalar operand Value rather than an integer, since the runtime case has no compile-time attribute.
+- The "splat zero → constant zero" short-circuit can only fire when the scalar is statically known to be zero, so it is skipped for a runtime scalar. This falls out for free: that short-circuit is a separate m_Constant → m_AnyZeroFloat match that a runtime value never satisfies.
+- The "splat → scalar × reduce(other_operand)" rewrite applies to both cases, but the multiply differs by source. The constant path always emits a multiply by a constant built from the splat attribute; when that constant is 1.0, a downstream canonicalizer removes it, which is why @main in dot_general_ones.mlir ends up as a bare reduce. The runtime path always emits a multiply by a broadcast of the scalar Value, relying on the same canonicalizer to drop it if the value happens to be 1.
 
-One careful distinction in the rewrite:
-
-- The "splat zero → constant zero" short-circuit can only fire when the scalar is statically known to be zero; for a runtime scalar it is skipped.
-- The general "splat-like → scalar × reduce(other_operand)" rewrite applies to both cases, but the multiply differs by source. The existing constant path multiplies by a constant built from the splat attribute, and skips the multiply entirely when the value is 1.0 — which is why @main in dot_general_ones.mlir shows a bare reduce. The runtime path has no attribute, so it multiplies the reduce result by the broadcast's input Value and always emits the multiply, relying on the same downstream canonicalizer to collapse it if the value happens to be 1.0.
-
-The fix must handle the broadcast-of-scalar on either operand position, mirroring the existing code's separate LHS-constant and RHS-constant branches. The reproduction test only exercises the LHS case, but a robust fix (and a reviewer) will expect both.
+The fix handles the broadcast on either operand position, mirroring the existing separate LHS and RHS branches; the reproduction test exercises both (Variant B on LHS, Variant C on RHS). A dtype-mismatch concern was checked and is a non-issue: dot_general requires matching operand element types, and the reduce's element type is taken from the non-splat operand, so it already equals the scalar's type — no convert is needed.
 
 ### Implementation Plan (UMPIRE)
 
 **Understand / Match / Plan:** as above; the file already contains the building blocks (`extractSplatInt`, `BroadcastInDimSimplify`, `BroadcastInDimOpCanon`).
 
-**Implement:** Phase III work — *not yet started in code.* The reproduction test is committed (`952b8104`); `EnzymeHLOOpt.cpp` has not yet been modified.
+**Implement:** Done. Added extractBroadcastScalar above DotGeneralSimplify; refactored detection to booleans (lhsSplat/rhsSplat) that accept either a splat constant or a rank-0 broadcast; split the final multiply into constant vs. runtime-scalar paths. Changes are uncommitted pending resolution of the multifloat lit failures.
 
 **Review:** Mirror style from `git log --oneline -20`; check for `CONTRIBUTING.md`. Preserve results of every existing test, especially `dot_general_ones.mlir`.
 
@@ -113,8 +109,8 @@ The fix must handle the broadcast-of-scalar on either operand position, mirrorin
 ### Unit Tests
 
 - [x] Reproduction baseline committed (Phase II): two functions, constant-broadcast (works pre-fix) and runtime-scalar (broken pre-fix).
-- [ ] Post-fix: runtime variant no longer contains `stablehlo.dot_general`.
-- [ ] Regression: `dot_general_ones.mlir` output unchanged after the fix.
+- [x] Post-fix: runtime variant no longer contains `stablehlo.dot_general`.
+- [x] Regression: `dot_general_ones.mlir` output unchanged after the fix.
 - [ ] Directory sweep + `bazel test //test/lit_tests/...` green.
 
 ### Integration Tests
@@ -143,8 +139,8 @@ The fix must handle the broadcast-of-scalar on either operand position, mirrorin
 
 ### Code Changes
 
-- **Files to modify (planned):** src/enzyme_ad/jax/Passes/EnzymeHLOOpt.cpp — add extractSplatLikeScalar helper and refactor DotGeneralSimplify::matchAndRewriteImpl to use it. test/lit_tests/dot_general_bcast_scalar.mlir — reproduction test, already committed.
-- **Key commits:** 559b9f7e (reproduction test). Fix commit: not yet.
+- **Files to modify (planned):** src/enzyme_ad/jax/Passes/EnzymeHLOOpt.cpp — added extractBroadcastScalar helper and refactored DotGeneralSimplify::matchAndRewriteImpl. test/lit_tests/dot_general_bcast_scalar.mlir — added Variant C (RHS runtime scalar).
+- **Key commits:** 559b9f7e (reproduction test). Fix commit: pending (uncommitted until multifloat failures resolved).
 - **Approach decisions:** [Why you chose certain approaches]
 
 ---
