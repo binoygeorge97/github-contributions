@@ -1,10 +1,15 @@
 # Contribution 1: Extend DotGeneralSimplify to handle Broadcasted Scalars
 
 **Contribution Number:** 1
+
 **Student:** Binoy George
+
 **Issue:** https://github.com/EnzymeAD/Enzyme-JAX/issues/1475
+
 **Pull Request:** https://github.com/EnzymeAD/Enzyme-JAX/pull/2637
+
 **Status:** Phase I [Complete], Phase II [Complete], Phase III [Complete], Phase IV [Complete] — PR #2637 submitted, CI green, review requested; closed unmerged on 27 Jul 2026 as superseded by PR #2216, a collaborator's pre-existing, more general implementation, which merged the same week and resolves issue #1475 in `main`.
+
 **Progress Update:** Full contribution cycle completed. Fix implemented in `DotGeneralSimplify` (`extractBroadcastScalar` helper + runtime path); build clean; reproduction test passed for all three variants; `dot_general_ones.mlir` regression unchanged; full lit sweep 1060/1063 (three `multifloat_*` failures pre-existing on branch base). PR #2637 opened 18 Jul with all CI checks and Codecov passing ("all modified and coverable lines covered"). On 27 Jul, collaborator @mofeing closed the PR, pointing to PR #2216 — an earlier, broader pattern that reduces broadcasted contracting dimensions for arbitrary tensors, of which my rank-0 scalar case is a subset. #2216 has since merged, so the underlying issue is now fixed upstream. Cycle 2 (new issue) starting.
 
 ---
